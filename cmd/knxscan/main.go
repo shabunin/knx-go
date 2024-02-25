@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/vapourismo/knx-go/knx"
 	"github.com/vapourismo/knx-go/knx/cemi"
@@ -46,6 +48,12 @@ func main() {
 		}
 		fmt.Printf("created connection to %s.%d\n", *lineP, i)
 		// TODO: receive info using APDU
+		time.Sleep(100 * time.Millisecond)
+		mask, err := cc.DeviceDescriptorRead([]byte{0x00})
+		if err != nil {
+			panic(err)
+		}
+		fmt.Println("device mask: ", hex.EncodeToString(mask))
 		cc.Close()
 	}
 	tun.Close()
