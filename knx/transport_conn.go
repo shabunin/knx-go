@@ -3,12 +3,16 @@ package knx
 import (
 	"context"
 	"errors"
+	"fmt"
+	"time"
 
 	"github.com/vapourismo/knx-go/knx/cemi"
 )
 
 type TransportConn struct {
 	Addr cemi.IndividualAddr
+
+	closed bool
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -30,45 +34,61 @@ func newTransportConn(addr cemi.IndividualAddr) *TransportConn {
 		outbound: make(chan cemi.Message),
 	}
 
-	go func() {
-		<-ctx.Done()
-		close(t.inbound)
-		close(t.outbound)
-	}()
-
 	return t
 }
 
 func (t *TransportConn) connect() error {
-	// TODO send connect
-	go func() {
-		// TODO serve <- inbound
-	}()
+	msg := cemi.LDataReq{
+		LData: cemi.LData{
+			Control1: cemi.Control1NoRepeat | cemi.Control1NoSysBroadcast |
+				cemi.Control1WantAck | cemi.Control1Prio(cemi.PrioSystem),
+			Control2: cemi.Control2Hops(6),
+		},
+	}
+	msg.LData.Destination = uint16(t.Addr)
+	msg.LData.Data = &cemi.AppData{
+		Numbered:  false,
+		SeqNumber: 0,
+		Data:      []byte{},
+	}
+	t.outbound <- &msg
+
+	select {
+	case income := <-t.inbound:
+		fmt.Printf("income: %s, %v\n", income.MessageCode().String(), income)
+		if con, ok := income.(*cemi.LDataCon); ok {
+			if (con.Control1 & cemi.Control1HasError) == 0x1 {
+				return errors.New("connection error")
+			}
+		}
+		return nil
+	case <-time.After(time.Second * 3): // TODO consult spec
+		t.disconnect()
+	}
+
 	return nil
 }
 func (t *TransportConn) disconnect() error {
-	// TODO send disconnect request
+	// cancel context
+	t.cancel()
+
+	// TODO send disconnect request but don't expect answer
+	close(t.inbound)
+	close(t.outbound)
+	t.closed = true
+
 	return nil
 }
 
 func (t *TransportConn) Closed() bool {
-	select {
-	case <-t.ctx.Done():
-		return true
-	default:
-		return false
-	}
+	return t.closed
 }
 
 func (t *TransportConn) Close() error {
-	select {
-	case <-t.ctx.Done():
+	if t.closed {
 		return errors.New("close of closed connection")
-	default:
 	}
-
 	t.disconnect()
-	t.cancel()
 
 	return nil
 }
@@ -78,7 +98,3 @@ func (t *TransportConn) PropertyWrite()        {}
 func (t *TransportConn) MemoryRead()           {}
 func (t *TransportConn) MemoryWrite()          {}
 func (t *TransportConn) UserMessage()          {}
-
-func (t *TransportConn) Done() <-chan struct{} {
-	return t.ctx.Done()
-}

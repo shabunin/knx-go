@@ -13,7 +13,7 @@ type TransportTunnel struct {
 	*Tunnel
 	mu      sync.RWMutex
 	conns   map[cemi.IndividualAddr]*TransportConn
-	inbound chan cemi.Message
+	inbound chan GroupEvent
 }
 
 func (t *TransportTunnel) serve() {
@@ -23,27 +23,29 @@ func (t *TransportTunnel) serve() {
 	defer util.Log(t.inbound, "Worker exited")
 
 	for msg := range inbound {
-		var isGroup bool
 		var addr cemi.IndividualAddr
 
 		if ind, ok := msg.(*cemi.LDataInd); ok {
-			isGroup = ind.Control2.IsGroupAddr()
 			addr = ind.Source
+			if app, ok := ind.Data.(*cemi.AppData); ok {
+				if app.Command.IsGroupCommand() {
+					outbound <- GroupEvent{
+						Command:     GroupCommand(app.Command),
+						Source:      addr,
+						Destination: cemi.GroupAddr(ind.Destination),
+						Data:        app.Data,
+					}
+					continue
+				}
+			}
 		} else if con, ok := msg.(*cemi.LDataCon); ok {
 			// confirmation of our own telegram
-			isGroup = con.Control2.IsGroupAddr()
-			addr = cemi.IndividualAddr(ind.Destination)
+			addr = cemi.IndividualAddr(con.Destination)
 		} else {
-			util.Log(t.inbound, "cemi frame does not belong to transport connection")
-			outbound <- msg
+			util.Log(t.inbound, "cemi frame contains unknown message code")
 			continue
 		}
 
-		if isGroup {
-			util.Log(t.inbound, "LData frame target is Group Address")
-			outbound <- msg
-			continue
-		}
 		t.mu.RLock()
 		tconn, ok := t.conns[addr]
 		t.mu.RUnlock()
@@ -53,7 +55,9 @@ func (t *TransportTunnel) serve() {
 		}
 		if tconn.Closed() {
 			util.Log(t.inbound, "transport connection found but closed")
-			// TODO delete
+			t.mu.Lock()
+			delete(t.conns, addr)
+			t.mu.Unlock()
 			continue
 		}
 		tconn.inbound <- msg
@@ -64,28 +68,46 @@ func (t *TransportTunnel) serve() {
 
 func (t *TransportTunnel) Dial(addr cemi.IndividualAddr) (*TransportConn, error) {
 	t.mu.Lock()
-	_, ok := t.conns[addr]
-	if ok {
+	c, ok := t.conns[addr]
+	if ok && !c.Closed() {
 		return nil, errors.New("transport connections already exist")
 	}
-	c := newTransportConn(addr)
+	c = newTransportConn(addr)
 	t.conns[addr] = c
 	t.mu.Unlock()
+
 	go func() {
-		<-c.Done()
-		t.mu.Lock()
-		defer t.mu.Unlock()
-		delete(t.conns, addr)
+		for {
+			select {
+			case msg, ok := <-c.outbound:
+				if !ok {
+					t.mu.Lock()
+					delete(t.conns, addr)
+					t.mu.Unlock()
+					return
+				}
+				t.Tunnel.Send(msg)
+			case <-c.ctx.Done():
+				t.mu.Lock()
+				delete(t.conns, addr)
+				t.mu.Unlock()
+				return
+			}
+		}
 	}()
-	return c, nil
+
+	err := c.connect()
+	return c, err
 }
 
 // NewTransportTunnel creates a new Tunnel with a transport connections support.
 func NewTransportTunnel(gatewayAddr string, config TunnelConfig) (tt TransportTunnel, err error) {
+	tt = TransportTunnel{
+		conns: make(map[cemi.IndividualAddr]*TransportConn),
+	}
 	tt.Tunnel, err = NewTunnel(gatewayAddr, knxnet.TunnelLayerData, config)
-
 	if err == nil {
-		tt.inbound = make(chan cemi.Message)
+		tt.inbound = make(chan GroupEvent)
 		go tt.serve()
 	}
 
@@ -93,11 +115,11 @@ func NewTransportTunnel(gatewayAddr string, config TunnelConfig) (tt TransportTu
 }
 
 // Send a group communication.
-func (gt *GroupTunnel) Send(event GroupEvent) error {
-	return gt.Tunnel.Send(&cemi.LDataReq{LData: buildGroupOutbound(event)})
+func (tt *TransportTunnel) Send(event GroupEvent) error {
+	return tt.Tunnel.Send(&cemi.LDataReq{LData: buildGroupOutbound(event)})
 }
 
 // Inbound returns the channel on which group communication can be received.
-func (gt *GroupTunnel) Inbound() <-chan GroupEvent {
-	return gt.inbound
+func (tt *TransportTunnel) Inbound() <-chan GroupEvent {
+	return tt.inbound
 }
